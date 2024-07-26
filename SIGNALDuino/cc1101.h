@@ -5,11 +5,13 @@
 
 #if defined(ARDUINO) && ARDUINO >= 100
 	#include "Arduino.h"
-#else
-	//#include "WProgram.h"
 #endif
-#include <EEPROM.h>
+
 #include "output.h"
+#include "hardware.h"
+#if defined(MAPLE_Mini) || defined(ESP32) || defined(ARDUINO_ARCH_RP2040)
+	#include <SPI.h>
+#endif
 
 #define ccMaxBuf 50
 extern uint16_t bankOffset;
@@ -207,10 +209,23 @@ namespace cc1101 {
 	}
 
 
-	uint8_t sendSPI(const uint8_t val) {					     // send byte via SPI
+	/*uint8_t sendSPI(const uint8_t val) {					     // send byte via SPI
 		SPDR = val;                                      // transfer byte via SPI
 		while (!(SPSR & _BV(SPIF)));                     // wait until SPI operation is terminated
 		return SPDR;
+	}*/
+	uint8_t sendSPI(const uint8_t val) {					     // send byte via SPI
+#ifdef MAPLE_Mini
+		return SPI_2.transfer(val);
+#elif defined(ESP32)
+		return SPI.transfer(val);
+#elif defined (ARDUINO_ARCH_RP2040)
+  return SPI.transfer(val);
+#else
+		SPDR = val;                                      // transfer byte via SPI
+		while (!(SPSR & _BV(SPIF)));                     // wait until SPI operation is terminated
+		return SPDR;
+#endif
 	}
 
 	uint8_t waitTo_Miso() {	// wait with timeout until MISO goes low
@@ -288,7 +303,7 @@ namespace cc1101 {
 		//waitV_Miso();                                    // wait until MISO goes low
 		sendSPI(CC1101_PATABLE | CC1101_WRITE_BURST);   // send register address
 		for (uint8_t i = 0; i < 8; i++) {
-			sendSPI(EEPROM.read(bankOffset + EE_CC1101_PA+i));                     // send value
+			sendSPI(EepromPtr->read(bankOffset + EE_CC1101_PA+i));                     // send value
 		}
 			cc1101_Deselect();
 	}
@@ -397,9 +412,9 @@ namespace cc1101 {
 void writeCCpatable(uint8_t var) {           // write 8 byte to patable (kein pa ramping)
 	for (uint8_t i = 0; i < 8; i++) {
 		if (i == 1) {
-			EEPROM.write(bankOffset + EE_CC1101_PA + i, var);
+			EepromPtr->write(bankOffset + EE_CC1101_PA + i, var);
 		} else {
-			EEPROM.write(bankOffset + EE_CC1101_PA + i, 0);
+			EepromPtr->write(bankOffset + EE_CC1101_PA + i, 0);
 		}
 	}
 	writePatable();
@@ -408,21 +423,21 @@ void writeCCpatable(uint8_t var) {           // write 8 byte to patable (kein pa
 
 	void ccFactoryReset(bool flag) {
 		for (uint8_t i = 0; i<sizeof(initVal); i++) {
-			EEPROM.write(bankOffset + EE_CC1101_CFG + i, pgm_read_byte(&initVal[i]));
+			EepromPtr->write(bankOffset + EE_CC1101_CFG + i, pgm_read_byte(&initVal[i]));
 		}
-		EEPROM.write(bankOffset + addr_CWccreset, 0xFF);
+		EepromPtr->write(bankOffset + addr_CWccreset, 0xFF);
 		if (flag == false) {
 			return;
 		}
 		for (uint8_t i = 0; i < 8; i++) {
 			if (i == 1) {
 				if (bankOffset == 0) {	// Bank 0 normalerweise 433 Mhz
-					EEPROM.write(bankOffset + EE_CC1101_PA + i, PATABLE_DEFAULT_433);
+					EepromPtr->write(bankOffset + EE_CC1101_PA + i, PATABLE_DEFAULT_433);
 				} else {
-					EEPROM.write(bankOffset + EE_CC1101_PA + i, PATABLE_DEFAULT_868);
+					EepromPtr->write(bankOffset + EE_CC1101_PA + i, PATABLE_DEFAULT_868);
 				}
 			} else {
-				EEPROM.write(bankOffset + EE_CC1101_PA + i, 0);
+				EepromPtr->write(bankOffset + EE_CC1101_PA + i, 0);
 			}
 		}
 		MSG_PRINTLN(F("ccFactoryReset done"));  
@@ -442,16 +457,30 @@ void writeCCpatable(uint8_t var) {           // write 8 byte to patable (kein pa
 	
 	inline void setup()
 	{
+	#ifdef MAPLE_Mini
+		// Setup SPI 2
+		SPI_2.begin();	//Initialize the SPI_2 port.
+		SPI_2.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+	#elif defined(ESP32)
+		SPI.begin(sckPin, misoPin, mosiPin, radioCsPin[0]);
+		SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  	#elif defined (ARDUINO_ARCH_RP2040)
+	    SPI.begin();
+	    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+	#else
 		pinAsOutput(sckPin);
 		pinAsOutput(mosiPin);
+		SPCR = _BV(SPE) | _BV(MSTR);               // SPI speed = CLK/4
 		pinAsInput(misoPin);
-		pinAsOutput(csPin);                    // set pins for SPI communication
+	#endif
+  	pinAsOutput(csPin);                    // set pins for SPI communication
+		digitalHigh(csPin);                 // SPI init
+
 		
 		#ifdef PIN_MARK433
 		pinAsInputPullUp(PIN_MARK433);
 		#endif
 		
-		SPCR = _BV(SPE) | _BV(MSTR);               // SPI speed = CLK/4
 		/*
 		SPCR = ((1 << SPE) |               		// SPI Enable
 		(0 << SPIE) |              		// SPI Interupt Enable
@@ -463,10 +492,12 @@ void writeCCpatable(uint8_t var) {           // write 8 byte to patable (kein pa
 
 		SPSR = (1 << SPI2X);             		// Double Clock Rate
 		*/
-		pinAsInput(PIN_SEND);        // gdo0Pi, sicherheitshalber bis zum CC1101 init erstmal input   
-		digitalHigh(csPin);                 // SPI init
+		//pinAsInput(PIN_SEND);        // gdo0Pi, sicherheitshalber bis zum CC1101 init erstmal input   
+
+	#if !defined(MAPLE_Mini) && !defined(ESP32) && !defined(ARDUINO_ARCH_RP2040)
 		digitalHigh(sckPin);
 		digitalLow(mosiPin);
+	#endif
 	}
 
 	uint8_t getRSSI()
@@ -631,14 +662,14 @@ void writeCCpatable(uint8_t var) {           // write 8 byte to patable (kein pa
 		
 		sendSPI(CC1101_WRITE_BURST);
 		for (uint8_t i = 0; i<sizeof(initVal); i++) {              // write EEPROM value to cc1101
-			sendSPI(EEPROM.read(bankOffset + EE_CC1101_CFG + i));
+			sendSPI(EepromPtr->read(bankOffset + EE_CC1101_CFG + i));
 		}
 		cc1101_Deselect();
 		delayMicroseconds(10);            // ### todo: welcher Wert ist als delay sinnvoll? ###
 
-		if (EEPROM.read(bankOffset + addr_CWccreset) == 0xA5 && ((EEPROM.read(bankOffset + addr_CWccTEST) & 0xF0) == 0x60)) {
+		if (EepromPtr->read(bankOffset + addr_CWccreset) == 0xA5 && ((EepromPtr->read(bankOffset + addr_CWccTEST) & 0xF0) == 0x60)) {
 			for (uint8_t i = 0; i<3; i++) {
-				writeReg(CC1101_TEST2 + i, EEPROM.read(bankOffset + CC1101_TEST2 + i));
+				writeReg(CC1101_TEST2 + i, EepromPtr->read(bankOffset + CC1101_TEST2 + i));
 			}
 		}
 		writePatable();                                 // write PatableArray to patable reg

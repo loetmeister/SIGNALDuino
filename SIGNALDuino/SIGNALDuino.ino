@@ -35,7 +35,7 @@
 #include "compile_config.h"
 
 #define PROGNAME               "RF_RECEIVER"
-#define PROGVERS               "3.3.5-dev210522"
+#define PROGVERS               "3.3.5-adv-rpi"
 #define VERSION_1               0x33
 #define VERSION_2               0x40
 
@@ -60,10 +60,15 @@
 		#define PIN_SEND              2   // gdo0Pin TX out
 		#define PIN_RECEIVE           3
 		#define PIN_MARK433	      A0
+	#elif RASPBERRY_PI_PICO
+    // static const uint8_t SPIpins[] = {MISO, SS, SCK, MOSI}; // pin 16 - 19
+    // #define PIN_LED               LED_BUILTIN //25
+		#define PIN_SEND              20   // gdo0Pin TX out
+		#define PIN_RECEIVE           21   // gdo2
 	#else 
 		#define PIN_LED               9
 		#define PIN_SEND              3   // gdo0Pin TX out
-	    #define PIN_RECEIVE           2
+	  #define PIN_RECEIVE           2
 	#endif
 #else
 	#define PIN_RECEIVE            2
@@ -84,14 +89,23 @@
 #include "output.h"
 #include "bitstore.h"
 #include "signalDecoder.h"
-#include <TimerOne.h>  // Timer for LED Blinking
+
+#include "FreeRam.h"
+#include "hardware.h"
+#if defined (ARDUINO_ARCH_RP2040)
+  #include <RPi_Pico_TimerInterrupt.h>  // https://github.com/khoih-prog/RPI_PICO_TimerInterrupt 
+  RPI_PICO_Timer ITimer1(1);
+  EEPROM24* EepromPtr = new EEPROM24(Wire, EEPROM_24LC08);
+#else
+  #include <TimerOne.h>  // Timer for LED Blinking
+  EEPROMClass* EepromPtr = &EEPROM;
+#endif
+
 
 #include "SimpleFIFO.h"
 SimpleFIFO<int,FIFO_LENGTH> FiFo; //store FIFO_LENGTH # ints
 SignalDetectorClass musterDec;
 
-
-#include <EEPROM.h>
 #include "cc1101.h"
 
 #define pulseMin  90
@@ -102,14 +116,14 @@ SignalDetectorClass musterDec;
 #define maxSendEcho 100
 
 // EEProm Address
-#define EE_MAGIC_OFFSET      0
+static const uint8_t EE_MAGIC_OFFSET = 0;
 //#define addr_togglesec       0x3C
-#define addr_ccN             0x3D
-#define addr_ccmode          0x3E
+static const uint8_t addr_ccN = 0x3D;
+static const uint8_t addr_ccmode = 0x3E;
 //#define addr_featuresB       0x3F
-#define addr_bankdescr       0x40    // 0x40-0x47 bis Bank 9 0x88-0x8F  # Bank 0 bis Bank 9, Kurzbeschreibungen (max 8 Zeichen)
-#define addr_bank            0xFD
-#define addr_features        0xFF
+static const uint8_t addr_bankdescr = 0x40;    // 0x40-0x47 bis Bank 9 0x88-0x8F  # Bank 0 bis Bank 9, Kurzbeschreibungen (max 8 Zeichen)
+static const uint8_t addr_bank = 0xFD;
+static const uint8_t addr_features = 0xFF;
 
 volatile bool blinkLED = false;
 String cmdstring = "";
@@ -199,7 +213,7 @@ const char string_6[] PROGMEM = "ccmode";
 const char string_7[] PROGMEM = "muthresh";
 const char string_8[] PROGMEM = "maxpulse";
 
-const char * const CSetCmd[] PROGMEM = { string_0, string_1, string_2, string_3, string_4, string_5, string_6, string_7, string_8};
+const char * const CSetCmd[CSetAnz] PROGMEM = { string_0, string_1, string_2, string_3, string_4, string_5, string_6, string_7, string_8};
 
 #ifdef CMP_MEMDBG
 
@@ -247,29 +261,57 @@ void handleInterrupt();
 void enableReceive();
 void disableReceive();
 void serialEvent();
+#if defined (ARDUINO_ARCH_RP2040)
+bool cronjob(struct repeating_timer *t);
+#else
 void cronjob();
-int freeRam();
+#endif
+// int freeRam();
 void HandleCommand();
 bool command_available=false;
 unsigned long getUptime();
-void storeFunctions(const int8_t ms=1, int8_t mu=1, int8_t mc=1, int8_t red=1, int8_t deb=0, int8_t led=1, int8_t overfl=0);
-void getFunctions(bool *ms,bool *mu,bool *mc, bool *red, bool *deb, bool *led, bool *overfl);
+void storeFunctions(const int8_t ms=1, int8_t mu=1, int8_t mc=1, int8_t red=1, int8_t deb=0, int8_t led=1, int8_t overfl=0, int8_t tgBank=0);
+void getFunctions(bool *ms,bool *mu,bool *mc, bool *red, bool *deb, bool *led, bool *overfl, bool *tgBank);
 void initEEPROM(void);
+void initEEPROMconfig(void);
+void callGetFunctions(void);
+void print_bank_sum();
+void print_Bank();
+uint16_t getBankOffset(uint8_t tmpBank);
 void setCCmode();
 uint8_t cmdstringPos2int(uint8_t pos);
 void printHex2(const byte hex);
 uint8_t rssiCallback() { return 0; };	// Dummy return if no rssi value can be retrieved from receiver
 
 
+
 void setup() {
+	delay(500);
+  #ifdef DEBUG
+	delay(2000);
+  #endif
+#if defined (ARDUINO_ARCH_RP2040)
+  Wire.begin();
+	if (!EepromPtr->available())
+   {
+     Serial.println("No memory detected. Freezing.");
+     #ifdef WATCHDOG
+       wdt_disable();
+     #endif
+     while (true)
+       ;
+   }
+#endif
 #if defined(ARDUINO_BUSWARE_CUL)
 	clock_prescale_set(clock_div_1);
 #endif
 	uint8_t ccVersion;
 	Serial.begin(BAUDRATE);
+  #if not defined (ARDUINO_ARCH_RP2040)
 	while (!Serial) {
 		; // wait for serial port to connect. Needed for native USB
 	}
+  #endif
 	//if (musterDec.MdebEnabled) {
 	DBG_PRINTLN(F("Using sFIFO"));
 	//}
@@ -337,8 +379,13 @@ void setup() {
 	}
 	delay(50);
 
-	Timer1.initialize(31*1000); //Interrupt wird jede 31 Millisekunden ausgeloest
-	Timer1.attachInterrupt(cronjob);
+	#if defined (ARDUINO_ARCH_RP2040)
+	  // RPI_PICO_Timer ITimer1(1);
+	  ITimer1.attachInterruptInterval(31*1000, cronjob);
+	#else
+		Timer1.initialize(31*1000); //Interrupt wird jede 31 Millisekunden ausgeloest
+		Timer1.attachInterrupt(cronjob);
+	#endif
 
 	cmdstring.reserve(maxCmdString);
 
@@ -361,7 +408,12 @@ void setup() {
 #endif
 }
 
+#if defined (ARDUINO_ARCH_RP2040)
+bool cronjob(struct repeating_timer *t) {
+	(void) t;
+#else
 void cronjob() {
+#endif
 	static uint16_t cnt0 = 0;
 	static uint8_t cnt1 = 0;
 	cli();
@@ -386,12 +438,14 @@ void cronjob() {
 			getUptime();
 		}
 	}
+  #if defined (ARDUINO_ARCH_RP2040)
+	return true;
+  #endif
 }
 
 
 void loop() {
 	static int aktVal=0;
-	bool state;
 	uint8_t fifoCount;
 	
 #ifdef __AVR_ATmega32U4__	
@@ -415,7 +469,7 @@ void loop() {
 	while (FiFo.count()>0 ) { //Puffer auslesen und an Dekoder uebergeben
 
 		aktVal=FiFo.dequeue();
-		state = musterDec.decode(&aktVal);
+		musterDec.decode(&aktVal);
 		if (musterDec.MdebEnabled && musterDec.printMsgSuccess) {
 			fifoCount = FiFo.count();
 			if (fifoCount > MdebFifoLimit) {
@@ -458,8 +512,8 @@ void loop() {
 		if (fifoBytes > 0) {
 			uint8_t marcstate;
 			bool appendRSSI = false;
-			uint8_t RSSI;
-			if ((EEPROM.read(bankOffset + 2 +CC1101_PKTCTRL1) & 4) == 4) {
+			uint8_t RSSI = 0;
+			if ((EepromPtr->read(bankOffset + 2 +CC1101_PKTCTRL1) & 4) == 4) {
 				appendRSSI = true;
 			}
 			else {
@@ -491,7 +545,7 @@ void loop() {
 						MSG_PRINT(F(")"));
 					}
 					else {
-						uint8_t n = EEPROM.read(bankOffset + addr_ccN);
+						uint8_t n = EepromPtr->read(bankOffset + addr_ccN);
 						if (n > 0) {
 							MSG_PRINT(F(";N="));
 							MSG_PRINT(n);
@@ -738,7 +792,7 @@ void send_cmd()
 	int16_t startdata=0;
 	uint8_t counter=0;
 	bool isCombined = false;
-	bool extraDelay = false;
+	// bool extraDelay = false;
 
 	s_sendcmd command[maxSendCmd];
 	command[0].datastart = 0;
@@ -816,7 +870,7 @@ void send_cmd()
 #endif
 		} else if (msg_cmd0 == 'C') {
 			command[cmdNo].sendclock = cmdstring.substring(startdata, start_pos-1).toInt();
-			extraDelay = true;
+			// extraDelay = true;
 #ifdef DEBUGSENDCMD
 			MSG_PRINT(F("C="));
 			MSG_PRINTLN(command[cmdNo].sendclock);
@@ -890,7 +944,7 @@ void send_cmd()
 			MSG_PRINT(F("ccreg write back "));
 			for (uint8_t i=0;i<ccParamAnz;i++)
 			{
-				val = EEPROM.read(0x0f + i);
+				val = EepromPtr->read(0x0f + i);
 				printHex2(val);
 				cc1101::writeReg(0x0d + i, val);    // gemerkte Registerwerte zurueckschreiben
 			}
@@ -978,8 +1032,8 @@ void IT_CMDs();
 
 void HandleCommand()
 {
-	uint8_t reg;
-	uint8_t val;
+	// uint8_t reg;
+	// uint8_t val;
 	uint8_t i;
 	
 	for (i=0; i < cmdAnz; i++) {
@@ -1009,7 +1063,7 @@ void cmd_help_S()	// get help configvariables
 {
 	char buffer[12];
 	for (uint8_t i = 0; i < CSetAnz; i++) {
-	    strcpy_P(buffer, (char*)pgm_read_word(&(CSetCmd[i])));
+	    strcpy_P(buffer, (char*)pgm_read_ptr(&(CSetCmd[i])));
 	    MSG_PRINT(F("CS"));
 	    MSG_PRINT(buffer);
 	    MSG_PRINT(F("= "));
@@ -1042,8 +1096,8 @@ void cmd_bank()
 		bank = cc1101::hex2int(digit);
 		bankOffset = getBankOffset(bank);
 		if (cmdstring.charAt(2) == '-' && bank > 0 && bank != bankOld) {  // Bank deaktivieren (ungueltig)
-			EEPROM.write(bankOffset, 255);
-			EEPROM.write(bankOffset+1, 255);
+			EepromPtr->write(bankOffset, 255);
+			EepromPtr->write(bankOffset+1, 255);
 			MSG_PRINT(F("Bank "));
 			MSG_PRINT(bank);
 			MSG_PRINTLN(F(" clear"));
@@ -1051,17 +1105,17 @@ void cmd_bank()
 			bankOffset = bankOffsetOld;
 			return;
 		}
-		if (bank == 0 || cmdstring.charAt(0) == 'e' || (EEPROM.read(bankOffset) == bank && EEPROM.read(bankOffset + 1) == (255 - bank))) {
+		if (bank == 0 || cmdstring.charAt(0) == 'e' || (EepromPtr->read(bankOffset) == bank && EepromPtr->read(bankOffset + 1) == (255 - bank))) {
 		  if (cmdstring.charAt(2) == 'f') {
 			uint8_t ccmodeOld = ccmode;
-			ccmode = EEPROM.read(bankOffset + addr_ccmode);
+			ccmode = EepromPtr->read(bankOffset + addr_ccmode);
 			if (ccmodeOld > 0 && ccmode > 0) {
 				cc1101::ccStrobe_SIDLE();	// Idle mode
 				uint8_t val;
 				uint8_t n = 0;
 				for (uint8_t i = 0; i <= 0x26; i++) {
-					val = EEPROM.read(bankOffset + 2 + i);
-					if (val != EEPROM.read(bankOffsetOld + 2 + i)) {
+					val = EepromPtr->read(bankOffset + 2 + i);
+					if (val != EepromPtr->read(bankOffsetOld + 2 + i)) {
 						n++;
 						//printHex2(i);
 						//printHex2(val);
@@ -1086,15 +1140,15 @@ void cmd_bank()
 		  }
 		  else {
 			if (cmdstring.charAt(2) == 'W') {
-				EEPROM.write(addr_bank, bank);
+				EepromPtr->write(addr_bank, bank);
 				MSG_PRINT(F("write "));
 			}
 			MSG_PRINT(F("set "));
-			//ccN = EEPROM.read(bankOffset + addr_ccN);
-			ccmode = EEPROM.read(bankOffset + addr_ccmode);
+			//ccN = EepromPtr->read(bankOffset + addr_ccN);
+			ccmode = EepromPtr->read(bankOffset + addr_ccmode);
 			if (ccmode == 255) {
 				ccmode = 0;
-				EEPROM.write(bankOffset + addr_ccmode, ccmode);
+				EepromPtr->write(bankOffset + addr_ccmode, ccmode);
 			}
 			if (cmdstring.charAt(0) != 'e') {
 				print_Bank();
@@ -1138,11 +1192,11 @@ void print_ccconf(uint16_t bankOffs)
 	char hexString[6];
 	
 	MSG_PRINT(F(" sync="));
-	printHex2(EEPROM.read(bankOffs + 2 + CC1101_SYNC1));
-	printHex2(EEPROM.read(bankOffs + 2 + CC1101_SYNC0));
+	printHex2(EepromPtr->read(bankOffs + 2 + CC1101_SYNC1));
+	printHex2(EepromPtr->read(bankOffs + 2 + CC1101_SYNC0));
 	MSG_PRINT(F(" ccconf="));
 	for (uint8_t i = 0x0F; i <= 0x1F; i++) {
-		printHex2(EEPROM.read(bankOffs + i));
+		printHex2(EepromPtr->read(bankOffs + i));
 	}
 	MSG_PRINT(F(" boffs="));
 	sprintf(hexString, "%04X", bankOffs);
@@ -1151,7 +1205,7 @@ void print_ccconf(uint16_t bankOffs)
 
 void print_Bank()
 {
-	uint8_t tmp_ccN = EEPROM.read(bankOffset + addr_ccN);
+	uint8_t tmp_ccN = EepromPtr->read(bankOffset + addr_ccN);
 	
 	MSG_PRINT(F("b="));
 	MSG_PRINT(bank);
@@ -1183,9 +1237,9 @@ void print_bank_sum()	// bs - Banksummary
 		bankStr[i2+1] = ' ';
 		
 		sBankoff = getBankOffset(i);
-		if ((EEPROM.read(sBankoff) == i && EEPROM.read(sBankoff+1) == (255 - i)) || i == 0) {
-			Nstr[i2] = '0' + EEPROM.read(sBankoff + addr_ccN);
-			sCcmode = EEPROM.read(sBankoff + addr_ccmode);
+		if ((EepromPtr->read(sBankoff) == i && EepromPtr->read(sBankoff+1) == (255 - i)) || i == 0) {
+			Nstr[i2] = '0' + EepromPtr->read(sBankoff + addr_ccN);
+			sCcmode = EepromPtr->read(sBankoff + addr_ccmode);
 			if (sCcmode < 10) {
 				ccmodeStr[i2] = '0' + sCcmode;
 			}
@@ -1235,7 +1289,7 @@ void print_bank_sum()	// bs - Banksummary
 			}
 			else {
 				for (j = 0; j < 8; j++) {
-					ch = EEPROM.read(addr_bankdescr + (i * 8) + j);
+					ch = EepromPtr->read(addr_bankdescr + (i * 8) + j);
 					if ((ch >= 32 && ch <= 122) || ch == 0) {	// space to z
 						bankStr[j] = ch;
 						if (ch == 0) {	// end
@@ -1302,17 +1356,22 @@ void cmd_freeRam()	// R: FreeMemory
 
 void cmd_send()
 {
-	if (musterDec.getState() != searching )
+	/*if (musterDec.getState() != searching )
 	{
 		command_available=true;
-	} else {
+	} else {*/
 		if (cmdstring.charAt(1) != 'N') {
 			send_cmd(); // Part of Send
 		}
 		else {
-			send_ccFIFO();
+			if (hasCC1101) {
+				send_ccFIFO();
+			}
+			else {
+				unsuppCmd = true;
+			}
 		}
-	}
+	//}
 }
 
 void cmd_uptime()	// t: Uptime
@@ -1336,7 +1395,7 @@ void ccRegWrite()	// CW cc register write
 	bool flag = false;
 	bool resetFlag = false;
     
-	uint8_t CWccreset = EEPROM.read(bankOffset + addr_CWccreset);
+	uint8_t CWccreset = EepromPtr->read(bankOffset + addr_CWccreset);
 	if ((CWccreset == 0xA5 || CWccreset == 0xA6) &&  cmdstring.charAt(6) == ',') { 
 		cc1101::ccFactoryReset(false);
 		cc1101::CCinit();
@@ -1371,7 +1430,7 @@ void ccRegWrite()	// CW cc register write
 		}
 		if (reg < 0x40) {
 			if (reg != 0x2F) {	// bei Testregister kein write
-				EEPROM.write(bankOffset + reg, val);
+				EepromPtr->write(bankOffset + reg, val);
 				if (reg == 0x37) {		// Ende der patable
 					cc1101::writePatable();
 				}
@@ -1379,7 +1438,7 @@ void ccRegWrite()	// CW cc register write
 		}
 		else {		// 0x40 - 0x47  Bank Kurzbeschreibung (max 8 Zeichen)
 			reg = reg + (bank * 8);
-			EEPROM.write(reg, val);
+			EepromPtr->write(reg, val);
 		}
 		/*MSG_PRINT(F("reg="));
 		printHex2(reg);
@@ -1443,13 +1502,13 @@ void cmd_writeEEPROM()	// write EEPROM und CC11001 register
          reg = cmdstringPos2int(1);
          val = cmdstringPos2int(3);
          if (reg < 0x40) {
-           EEPROM.write(bankOffset + reg, val);
+           EepromPtr->write(bankOffset + reg, val);
            if (hasCC1101 && reg <= 0x2A) {  // nur bis cc1101_reg 0x28
              cc1101::writeReg(reg-2, val);
            }
          }
          else {   // ab 0x40 immer in Bank 0
-           EEPROM.write(reg, val);
+           EepromPtr->write(reg, val);
          }
          MSG_PRINT("W");
          printHex2(reg);
@@ -1480,7 +1539,7 @@ void cmd_readEEPROM()	// R<adr>  read EEPROM
 			MSG_PRINT(F(":"));
 			for (uint8_t i = 0; i < 16; i++) {
 				MSG_PRINT(F(" "));
-				printHex2(EEPROM.read(addr + i));
+				printHex2(EepromPtr->read(addr + i));
 			}
 			addr += 16;
 			MSG_PRINT(F("  "));
@@ -1496,11 +1555,11 @@ void cmd_readEEPROM()	// R<adr>  read EEPROM
          MSG_PRINT(F(" :"));
          for (uint8_t i = 0; i < 16; i++) {
              MSG_PRINT(F(" "));
-             printHex2(EEPROM.read(bankOffset + reg + i));
+             printHex2(EepromPtr->read(bankOffset + reg + i));
          }
      } else {
         MSG_PRINT(F(" = "));
-        printHex2(EEPROM.read(bankOffset + reg));
+        printHex2(EepromPtr->read(bankOffset + reg));
      }
      MSG_PRINTLN("");
   } else {
@@ -1538,13 +1597,13 @@ void cmd_ccFactoryReset()
          }
          cc1101::ccFactoryReset(true);
          cc1101::CCinit();
-         EEPROM.write(bankOffset + addr_ccN, 0);
+         EepromPtr->write(bankOffset + addr_ccN, 0);
          ccmode = 0;
-         EEPROM.write(bankOffset + addr_ccmode, ccmode);
+         EepromPtr->write(bankOffset + addr_ccmode, ccmode);
          setCCmode();
          if (bank > 0) {
-            EEPROM.write(bankOffset, bank);
-            EEPROM.write(bankOffset + 1, (255 - bank));
+            EepromPtr->write(bankOffset, bank);
+            EepromPtr->write(bankOffset + 1, (255 - bank));
          }
          if (cmdstring.charAt(0) == 'e') {
             print_Bank();
@@ -1680,7 +1739,7 @@ inline void configSET()
 		unsuppCmd = true;
 	}
 	while (n < CSetAnz) {
-		strcpy_P(buffer, (char*)pgm_read_word(&(CSetCmd[n])));
+		strcpy_P(buffer, (char*)pgm_read_ptr(&(CSetCmd[n])));
 		if (cmdstring.substring(2, i) == buffer) {
 			MSG_PRINT(buffer);
 			MSG_PRINT(F("="));
@@ -1688,18 +1747,18 @@ inline void configSET()
 				val = cmdstring.substring(i+1).toInt();
 				MSG_PRINTLN(val);
 				if (n == CSccmode || n == CSccN) {
-					EEPROM.write(bankOffset + CSetAddr[n], val);
+					EepromPtr->write(bankOffset + CSetAddr[n], val);
 				} else {
-					EEPROM.write(CSetAddr[n], val);
+					EepromPtr->write(CSetAddr[n], val);
 				}
 			}
 			else {
 				val16 = cmdstring.substring(i+1).toInt();
 				MSG_PRINTLN(val16);
 				val = (val16>>8) & 0xFF;
-				EEPROM.write(CSetAddr[n+(n-CSet16)], val);		// high
+				EepromPtr->write(CSetAddr[n+(n-CSet16)], val);		// high
 				val = val16 & 0xFF;
-				EEPROM.write(CSetAddr[n+(n-CSet16)+1], val);	// low
+				EepromPtr->write(CSetAddr[n+(n-CSet16)+1], val);	// low
 			}
 			break;
 		}
@@ -1771,8 +1830,8 @@ void serialEvent()
 }
 
 
-int freeRam () {
 #ifdef CMP_MEMDBG
+int freeRam () {
 
  check_mem();
 
@@ -1827,13 +1886,13 @@ int freeRam () {
  MSG_PRINT("\nstack size=["); MSG_PRINT( stackSize, DEC ); MSG_PRINT("] bytes decimal");
  MSG_PRINT("\nfree size1=["); MSG_PRINT( freeMem1, DEC ); MSG_PRINT("] bytes decimal");
  MSG_PRINT("\nfree size2=["); MSG_PRINT( freeMem2, DEC ); MSG_PRINT("] bytes decimal");
-#else
+/*#else
   extern int __heap_start, *__brkval;
   int v;
-  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);*/
+ }
 #endif // CMP_MEMDBG
 
- }
 
 inline unsigned long getUptime()
 {
@@ -1905,7 +1964,7 @@ void storeFunctions(const int8_t ms, int8_t mu, int8_t mc, int8_t red, int8_t de
 	overfl=overfl<<6;
 	tgBank=tgBank<<7;
 	int8_t dat =  ms | mu | mc | red | deb | led | overfl | tgBank;
-    EEPROM.write(addr_features,dat);
+    EepromPtr->write(addr_features,dat);
 }
 
 void callGetFunctions(void)
@@ -1916,7 +1975,7 @@ void callGetFunctions(void)
 void getFunctions(bool *ms,bool *mu,bool *mc, bool *red, bool *deb, bool *led, bool *overfl, bool *tgBank)
 {
     int8_t high;
-    int8_t dat = EEPROM.read(addr_features);
+    int8_t dat = EepromPtr->read(addr_features);
 
     *ms=bool (dat &(1<<0));
     *mu=bool (dat &(1<<1));
@@ -1927,30 +1986,30 @@ void getFunctions(bool *ms,bool *mu,bool *mc, bool *red, bool *deb, bool *led, b
     *overfl=bool (dat &(1<<6));
     *tgBank= bool (dat &(1<<7));
     
-    MdebFifoLimit = EEPROM.read(CSetAddr[0]);
-    musterDec.MsMoveCountmax = EEPROM.read(CSetAddr[2]);
-    musterDec.MuOverflMax = EEPROM.read(CSetAddr[3]);
-    musterDec.cMaxNumPattern = EEPROM.read(CSetAddr[4]);
-    bank = EEPROM.read(addr_bank);
+    MdebFifoLimit = EepromPtr->read(CSetAddr[0]);
+    musterDec.MsMoveCountmax = EepromPtr->read(CSetAddr[2]);
+    musterDec.MuOverflMax = EepromPtr->read(CSetAddr[3]);
+    musterDec.cMaxNumPattern = EepromPtr->read(CSetAddr[4]);
+    bank = EepromPtr->read(addr_bank);
     if (bank > 9) {
       bank = 0;
     }
     bankOffset = getBankOffset(bank);
-    //ccN = EEPROM.read(bankOffset + addr_ccN);
-    ccmode = EEPROM.read(bankOffset + addr_ccmode);
+    //ccN = EepromPtr->read(bankOffset + addr_ccN);
+    ccmode = EepromPtr->read(bankOffset + addr_ccmode);
     if (ccmode == 255) {
        ccmode = 0;
-       EEPROM.write(bankOffset + addr_ccmode, ccmode);
+       EepromPtr->write(bankOffset + addr_ccmode, ccmode);
     }
-    high = EEPROM.read(CSetAddr[CSet16]);
-    musterDec.MuSplitThresh = EEPROM.read(CSetAddr[CSet16+1]) + ((high << 8) & 0xFF00);
-    high = EEPROM.read(CSetAddr[CSet16+2]);
-    musterDec.cMaxPulse = EEPROM.read(CSetAddr[CSet16+3]) + ((high << 8) & 0xFF00);
+    high = EepromPtr->read(CSetAddr[CSet16]);
+    musterDec.MuSplitThresh = EepromPtr->read(CSetAddr[CSet16+1]) + ((high << 8) & 0xFF00);
+    high = EepromPtr->read(CSetAddr[CSet16+2]);
+    musterDec.cMaxPulse = EepromPtr->read(CSetAddr[CSet16+3]) + ((high << 8) & 0xFF00);
     if (musterDec.cMaxPulse == 0) {
        musterDec.cMaxPulse = maxPulse;
     }
     musterDec.cMaxPulse = -musterDec.cMaxPulse;
-    musterDec.mcMinBitLen = EEPROM.read(CSetAddr[1]);
+    musterDec.mcMinBitLen = EepromPtr->read(CSetAddr[1]);
     if (musterDec.mcMinBitLen == 0) {
         musterDec.mcMinBitLen = mcMinBitLenDef;
     }
@@ -1958,18 +2017,18 @@ void getFunctions(bool *ms,bool *mu,bool *mc, bool *red, bool *deb, bool *led, b
 
 void initEEPROMconfig(void)
 {
-	EEPROM.write(addr_features, 0x3F);    	// Init EEPROM with all flags enabled, except MuNoOverflow and toggleBank
+	EepromPtr->write(addr_features, 0x3F);    	// Init EEPROM with all flags enabled, except MuNoOverflow and toggleBank
 	
 	for (uint8_t i = 0; i < CSetAnzEE; i++) {
-		EEPROM.write(CSetAddr[i], CSetDef[i]);
+		EepromPtr->write(CSetAddr[i], CSetDef[i]);
 	}
-	EEPROM.write(addr_bank, 0);
+	EepromPtr->write(addr_bank, 0);
 	MSG_PRINTLN(F("Init eeprom to defaults"));
 }
 
 void initEEPROM(void)
 {
-  if (EEPROM.read(EE_MAGIC_OFFSET) == VERSION_1 && EEPROM.read(EE_MAGIC_OFFSET+1) == VERSION_2) {
+  if (EepromPtr->read(EE_MAGIC_OFFSET) == VERSION_1 && EepromPtr->read(EE_MAGIC_OFFSET+1) == VERSION_2) {
     
   //if (musterDec.MdebEnabled) {
     #ifdef DEBUG
@@ -1981,12 +2040,13 @@ void initEEPROM(void)
     initEEPROMconfig();
     //storeFunctions(1, 1, 1);    // Init EEPROM with all flags enabled
     #ifdef CMP_CC1101
-       if (EEPROM.read(EE_MAGIC_OFFSET) != VERSION_1) {  // ccFactoryReset nur wenn VERSION_1 nicht passt
+       if (EepromPtr->read(EE_MAGIC_OFFSET) != VERSION_1) {  // ccFactoryReset nur wenn VERSION_1 nicht passt
           cc1101::ccFactoryReset(true);
        }
     #endif
-    EEPROM.write(EE_MAGIC_OFFSET, VERSION_1);
-    EEPROM.write(EE_MAGIC_OFFSET+1, VERSION_2);
+    EepromPtr->write(EE_MAGIC_OFFSET, VERSION_1);
+    EepromPtr->write(EE_MAGIC_OFFSET+1, VERSION_2);
   }
   callGetFunctions();
 }
+
