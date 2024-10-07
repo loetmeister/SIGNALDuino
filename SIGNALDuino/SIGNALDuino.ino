@@ -35,7 +35,7 @@
 #include "compile_config.h"
 
 #define PROGNAME               "RF_RECEIVER"
-#define PROGVERS               "3.3.5-adv-rpi"
+#define PROGVERS               "3.3.5-dev241007"
 #define VERSION_1               0x33
 #define VERSION_2               0x40
 
@@ -61,7 +61,6 @@
 		#define PIN_RECEIVE           3
 		#define PIN_MARK433	      A0
 	#elif RASPBERRY_PI_PICO
-    // static const uint8_t SPIpins[] = {MISO, SS, SCK, MOSI}; // pin 16 - 19
     // #define PIN_LED               LED_BUILTIN //25
 		#define PIN_SEND              20   // gdo0Pin TX out
 		#define PIN_RECEIVE           21   // gdo2
@@ -82,15 +81,11 @@
 
 #define DEBUG                  1
 
-#ifdef WATCHDOG
-	#include <avr/wdt.h>
-#endif
 #include "FastDelegate.h"
 #include "output.h"
 #include "bitstore.h"
 #include "signalDecoder.h"
 
-#include "FreeRam.h"
 #include "hardware.h"
 #if defined (ARDUINO_ARCH_RP2040)
   #include <RPi_Pico_TimerInterrupt.h>  // https://github.com/khoih-prog/RPI_PICO_TimerInterrupt 
@@ -232,7 +227,6 @@ void check_mem() {
  stackptr =  (uint8_t *)(SP);           // save value of stack pointer
 }
 //extern int __bss_end;
-//extern void *__brkval;
 
 int get_free_memory()
 {
@@ -266,7 +260,7 @@ bool cronjob(struct repeating_timer *t);
 #else
 void cronjob();
 #endif
-// int freeRam();
+int freeRam();
 void HandleCommand();
 bool command_available=false;
 unsigned long getUptime();
@@ -295,9 +289,9 @@ void setup() {
 	if (!EepromPtr->available())
    {
      Serial.println("No memory detected. Freezing.");
-     #ifdef WATCHDOG
-       wdt_disable();
-     #endif
+      #ifdef WATCHDOG
+        DISABLE_WATCHDOG();
+      #endif
      while (true)
        ;
    }
@@ -316,7 +310,7 @@ void setup() {
 	DBG_PRINTLN(F("Using sFIFO"));
 	//}
 #ifdef WATCHDOG
-	if (MCUSR & (1 << WDRF)) {
+	if (WATCHDOG_CAUSED_RESET()) {
 		MSG_PRINTLN(F("Watchdog caused a reset"));
 	}
 	/*
@@ -330,16 +324,16 @@ void setup() {
 		DBG_PRINTLN("power on reset occured");
 	}
 	*/
-	wdt_reset();
+	RESET_WATCHDOG();
 
-	wdt_enable(WDTO_2S);  	// Enable Watchdog
+	ENABLE_WATCHDOG();  	// Enable Watchdog
 #endif
 	//delay(2000);
 	pinAsInput(PIN_RECEIVE);
 	pinAsOutput(PIN_LED);
 	// CC1101
 #ifdef WATCHDOG
-	wdt_reset();
+	RESET_WATCHDOG();
 #endif
 #ifdef CMP_CC1101
 	cc1101::setup();
@@ -460,7 +454,7 @@ void loop() {
 		}
 	}
 #ifdef WATCHDOG
-	wdt_reset();
+	RESET_WATCHDOG();
 #endif
 #ifndef ONLY_FSK
   if (ccmode == 0) {
@@ -1829,9 +1823,8 @@ void serialEvent()
   }
 }
 
-
-#ifdef CMP_MEMDBG
 int freeRam () {
+ #ifdef CMP_MEMDBG
 
  check_mem();
 
@@ -1886,13 +1879,19 @@ int freeRam () {
  MSG_PRINT("\nstack size=["); MSG_PRINT( stackSize, DEC ); MSG_PRINT("] bytes decimal");
  MSG_PRINT("\nfree size1=["); MSG_PRINT( freeMem1, DEC ); MSG_PRINT("] bytes decimal");
  MSG_PRINT("\nfree size2=["); MSG_PRINT( freeMem2, DEC ); MSG_PRINT("] bytes decimal");
-/*#else
+ return freeMem2;
+#else
+ #if defined (ARDUINO_ARCH_RP2040)
+  extern char __StackLimit, __bss_end__;
+  struct mallinfo mi = mallinfo();
+  return (int)((uint32_t)(&__StackLimit  - &__bss_end__) - mi.uordblks);
+ #else
   extern int __heap_start, *__brkval;
   int v;
-  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);*/
- }
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
+ #endif
 #endif // CMP_MEMDBG
-
+}
 
 inline unsigned long getUptime()
 {

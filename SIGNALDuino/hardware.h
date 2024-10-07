@@ -1,7 +1,7 @@
 /*
  * hardware.h
  *
- *  Created on: 23.05.2018
+ *  Created on: 23.09.2024
  *      Author: loetmeister.de
  */
 
@@ -10,6 +10,7 @@
 
 
 #if defined (ARDUINO_ARCH_RP2040)
+  #include <malloc.h>
   // #include <Wire.h>
   #include "extras/EEPROM24.h"
   class EEPROM24;    // forward declare class
@@ -23,25 +24,24 @@
   extern EEPROMClass* EepromPtr;
 #endif
 
-/* watchdog macros, config, reboot and reset*/
-#if defined (__AVR__)
-  // #include "avr/wdt.h"
-  // // if watchdog is used & active, just run into infinite loop to force reset
-  // #define RESET_HARDWARE() while(1){}
-  // #define ENABLE_WATCHDOG() wdt_enable(WDTO_1S)
-  // #define RESET_WATCHDOG() wdt_reset()
-  // // Arduino Reset via Software function declaration, point to address 0 (reset vector)
-  // #define RESET_SOFTWARE() resetSoftware()
+/* watchdog macros, config, reboot and reset for SIGNALDuino*/
+#if defined (__AVR__) and defined(WATCHDOG)
+  #include "avr/wdt.h"
+  #define RESET_HARDWARE() while(1){}
+  #define ENABLE_WATCHDOG() wdt_enable(WDTO_2S)
+  #define DISABLE_WATCHDOG() wdt_disable()
+  #define RESET_WATCHDOG() wdt_reset()
+  #define WATCHDOG_CAUSED_RESET() MCUSR & (1 << WDRF)
 
-#elif defined (ARDUINO_ARCH_RP2040)
+#elif defined (ARDUINO_ARCH_RP2040) and defined(WATCHDOG)
   #include <hardware/watchdog.h>
-  #define ENABLE_WATCHDOG() watchdog_enable(1000, 0)
+  #define ENABLE_WATCHDOG() watchdog_enable(2000, 0)
+  #define DISABLE_WATCHDOG() watchdog_disable()
   #define RESET_WATCHDOG() watchdog_update()
 //watchdog_reboot(0, 0, 10);  // watchdog fire after 10us and busy waits // or watchdog_reboot(0, SRAM_END, 0) ??
   #define RESET_HARDWARE() watchdog_reboot(0, SRAM_END, 10);\
     for (;;) { }
-  // always reboot via watchdog
-  #define RESET_SOFTWARE() RESET_HARDWARE()
+  #define WATCHDOG_CAUSED_RESET() watchdog_caused_reboot()
 #endif
 
 

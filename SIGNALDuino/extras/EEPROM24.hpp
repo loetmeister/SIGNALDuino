@@ -26,7 +26,6 @@
  * and update() for single byte write.
 */
 
-#include "EEPROM24.h"
 
 /**
  * \class EEPROM24 EEPROM24.h <EEPROM24.h>
